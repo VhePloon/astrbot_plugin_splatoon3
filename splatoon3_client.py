@@ -85,6 +85,8 @@ class Splatoon3Client:
         self._session_lock = asyncio.Lock()
         # 缓存锁，保护缓存字典的并发访问
         self._cache_lock = asyncio.Lock()
+        # 缓存访问时间，用于主动驱逐
+        self._cache_access_time: dict[str, float] = {}
 
     def _log_api_data(self, endpoint: str, data: dict):
         """记录API源数据到日志
@@ -121,10 +123,35 @@ class Splatoon3Client:
             if cache_key in self._cache:
                 cached = self._cache[cache_key]
                 if time.time() - cached["timestamp"] < self.cache_ttl:
+                    # 更新访问时间
+                    self._cache_access_time[cache_key] = time.time()
                     return cached["data"]
                 # 缓存过期，删除
                 del self._cache[cache_key]
+                if cache_key in self._cache_access_time:
+                    del self._cache_access_time[cache_key]
         return None
+
+    async def _cleanup_expired_cache(self):
+        """清理过期的缓存"""
+        if not self.cache_enabled:
+            return
+
+        current_time = time.time()
+        expired_keys = []
+        
+        async with self._cache_lock:
+            for cache_key, cached in self._cache.items():
+                if current_time - cached["timestamp"] >= self.cache_ttl:
+                    expired_keys.append(cache_key)
+            
+            for cache_key in expired_keys:
+                del self._cache[cache_key]
+                if cache_key in self._cache_access_time:
+                    del self._cache_access_time[cache_key]
+        
+        if expired_keys:
+            logger.info(f"[Splatoon3] 清理了 {len(expired_keys)} 个过期缓存")
 
     async def _get_session(self):
         """获取或创建aiohttp ClientSession"""

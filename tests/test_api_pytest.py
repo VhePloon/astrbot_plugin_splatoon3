@@ -46,7 +46,3 @@ async def test_locale_translation():
         
     finally:
         await client.close()
-
-
-if __name__ == "__main__":
-    asyncio.run(test_api_connection())

@@ -56,20 +56,29 @@ class Splatoon3Plugin(Star):
         self.client_ttl = self.config.get("client_ttl", 3600)
         # 清理间隔（秒），默认10分钟
         self.cleanup_interval = self.config.get("cleanup_interval", 600)
+        # 配置保存间隔（秒），默认5分钟
+        self.config_save_interval = self.config.get("config_save_interval", 300)
         # 清理任务
         self._cleanup_task = None
+        # 配置保存任务
+        self._config_save_task = None
+        # 配置是否需要保存标志
+        self._config_dirty = False
         
         # 输出配置信息（用于调试）
         logger.info(f"[Splatoon3] 插件配置: {self.config}")
         logger.info(f"[Splatoon3] 调试模式: {self.debug}")
         logger.info(f"[Splatoon3] 客户端TTL: {self.client_ttl}秒")
         logger.info(f"[Splatoon3] 清理间隔: {self.cleanup_interval}秒")
+        logger.info(f"[Splatoon3] 配置保存间隔: {self.config_save_interval}秒")
 
         if self.debug:
             logger.info("[Splatoon3] 调试模式已启用，API源数据将输出到日志")
         
         # 清理任务启动标志
         self._cleanup_started = False
+        # 配置保存任务启动标志
+        self._config_save_started = False
 
     def _load_user_configs(self) -> Dict:
         """加载用户配置"""
@@ -113,12 +122,7 @@ class Splatoon3Plugin(Star):
         async with self._config_lock:
             if user_id not in self.user_configs:
                 self.user_configs[user_id] = {"language": "zh-CN"}
-                # 在锁内保存配置，避免并发覆盖
-                try:
-                    with open(self.user_config_file, "w", encoding="utf-8") as f:
-                        json.dump(self.user_configs, f, ensure_ascii=False, indent=2)
-                except Exception as e:
-                    logger.error(f"[Splatoon3] 保存用户配置失败: {str(e)}")
+                self._config_dirty = True
             return self.user_configs[user_id].get("language", "zh-CN")
 
     async def _set_user_language(self, user_id: str, language: str):
@@ -127,12 +131,7 @@ class Splatoon3Plugin(Star):
             if user_id not in self.user_configs:
                 self.user_configs[user_id] = {}
             self.user_configs[user_id]["language"] = language
-            # 在锁内保存配置，避免并发覆盖
-            try:
-                with open(self.user_config_file, "w", encoding="utf-8") as f:
-                    json.dump(self.user_configs, f, ensure_ascii=False, indent=2)
-            except Exception as e:
-                logger.error(f"[Splatoon3] 保存用户配置失败: {str(e)}")
+            self._config_dirty = True
         
         # 清除缓存的客户端实例，确保下次获取时使用新语言
         client_to_close = None
@@ -161,6 +160,19 @@ class Splatoon3Plugin(Star):
             except asyncio.CancelledError:
                 pass
             logger.info("[Splatoon3] 定时清理任务已停止")
+        
+        # 停止定时配置保存任务
+        if self._config_save_task and not self._config_save_task.done():
+            self._config_save_task.cancel()
+            try:
+                await self._config_save_task
+            except asyncio.CancelledError:
+                pass
+            logger.info("[Splatoon3] 定时配置保存任务已停止")
+        
+        # 退出时保存配置
+        if self._config_dirty:
+            await self._save_user_configs()
         
         # 收集所有客户端
         clients_to_close = []
@@ -196,7 +208,15 @@ class Splatoon3Plugin(Star):
                     self._start_cleanup_task()
                     self._cleanup_started = True
         
-        # 先检查缓存
+        # 延迟启动定时配置保存任务，确保事件循环已就绪
+        if not self._config_save_started:
+            async with self._client_lock:
+                # 再次检查，防止竞态条件
+                if not self._config_save_started:
+                    self._start_config_save_task()
+                    self._config_save_started = True
+        
+        # 先检查缓存（只读操作，使用锁）
         async with self._client_lock:
             if user_id in self.clients:
                 # 更新最后使用时间
@@ -206,15 +226,23 @@ class Splatoon3Plugin(Star):
         # 如果缓存中没有，获取语言设置并创建客户端
         language = await self._get_user_language(user_id)
         
-        # 再次检查并创建客户端
+        # 在锁外部创建客户端实例
+        new_client = Splatoon3Client(language=language, debug=self.debug)
+        
+        # 将新客户端添加到缓存（使用锁）
         async with self._client_lock:
             if user_id not in self.clients:
-                self.clients[user_id] = Splatoon3Client(language=language, debug=self.debug)
+                self.clients[user_id] = new_client
                 self.clients_last_used[user_id] = time.time()
+                return new_client
             else:
-                # 更新最后使用时间
-                self.clients_last_used[user_id] = time.time()
-            return self.clients[user_id]
+                # 如果在创建期间其他请求已经创建了客户端，关闭新创建的客户端
+                if hasattr(new_client, 'close'):
+                    try:
+                        await new_client.close()
+                    except Exception as e:
+                        logger.error(f"[Splatoon3] 关闭新创建的客户端失败: {str(e)}")
+                return self.clients[user_id]
 
     async def _cleanup_expired_clients(self):
         """清理过期的客户端实例"""
@@ -266,6 +294,24 @@ class Splatoon3Plugin(Star):
         if self._cleanup_task is None or self._cleanup_task.done():
             self._cleanup_task = asyncio.create_task(self._cleanup_task_loop())
             logger.info("[Splatoon3] 定时清理任务已启动")
+
+    async def _config_save_task_loop(self):
+        """定时保存配置任务循环"""
+        while True:
+            try:
+                await asyncio.sleep(self.config_save_interval)
+                await self._save_user_configs()
+            except asyncio.CancelledError:
+                logger.info("[Splatoon3] 定时配置保存任务被取消")
+                raise
+            except Exception as e:
+                logger.error(f"[Splatoon3] 定时配置保存任务失败: {str(e)}")
+
+    def _start_config_save_task(self):
+        """启动定时配置保存任务"""
+        if self._config_save_task is None or self._config_save_task.done():
+            self._config_save_task = asyncio.create_task(self._config_save_task_loop())
+            logger.info("[Splatoon3] 定时配置保存任务已启动")
 
     @filter.command("splat3帮助")
     async def splat3_help(self, event: AstrMessageEvent):
