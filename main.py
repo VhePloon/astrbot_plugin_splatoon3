@@ -82,6 +82,19 @@ class Splatoon3Plugin(Star):
         # 配置保存任务启动标志
         self._config_save_started = False
 
+    async def on_load(self):
+        """插件加载时调用"""
+        # 启动后台任务
+        self._start_cleanup_task()
+        self._start_config_save_task()
+        logger.info("[Splatoon3] 插件已加载")
+
+    async def on_unload(self):
+        """插件卸载时调用"""
+        # 清理资源
+        await self.close()
+        logger.info("[Splatoon3] 插件已卸载")
+
     def _load_user_configs(self) -> Dict:
         """加载用户配置"""
         if self.user_config_file.exists():
@@ -93,9 +106,11 @@ class Splatoon3Plugin(Star):
                         logger.error(f"[Splatoon3] 用户配置文件格式错误，期望dict类型，实际为{type(data)}")
                         return {}
                     # 校验每个用户配置项的结构
+                    invalid_users = []
                     for user_id, config in data.items():
                         if not isinstance(config, dict):
-                            logger.warning(f"[Splatoon3] 用户 {user_id} 配置格式错误，已跳过")
+                            logger.warning(f"[Splatoon3] 用户 {user_id} 配置格式错误，已移除")
+                            invalid_users.append(user_id)
                             continue
                         # 确保language字段存在且有效
                         if "language" not in config:
@@ -103,6 +118,11 @@ class Splatoon3Plugin(Star):
                         elif config["language"] not in Splatoon3Client.LANGUAGES:
                             logger.warning(f"[Splatoon3] 用户 {user_id} 语言代码 {config['language']} 无效，已重置为默认值")
                             config["language"] = "zh-CN"
+                    
+                    # 移除无效用户配置
+                    for user_id in invalid_users:
+                        del data[user_id]
+                    
                     return data
             except json.JSONDecodeError as e:
                 logger.error(f"[Splatoon3] 用户配置文件JSON解析失败: {str(e)}")
@@ -769,10 +789,12 @@ class Splatoon3Plugin(Star):
         client = await self._get_client(user_id)
 
         try:
-            # 获取所有祭典数据
-            running_festivals = await client.get_running_splatfests(region)
-            upcoming_festivals = await client.get_upcoming_splatfests(region)
-            past_festivals = await client.get_past_splatfests(region)
+            # 并发获取所有祭典数据
+            running_festivals, upcoming_festivals, past_festivals = await asyncio.gather(
+                client.get_running_splatfests(region),
+                client.get_upcoming_splatfests(region),
+                client.get_past_splatfests(region)
+            )
 
             result = "🎪 祭典信息汇总\n" + "=" * 30 + "\n\n"
 

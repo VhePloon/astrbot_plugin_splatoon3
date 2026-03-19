@@ -211,6 +211,7 @@ class Splatoon3Client:
             return
 
         cache_key = self._get_cache_key(endpoint)
+        trigger_cleanup = False
         async with self._cache_lock:
             self._cache[cache_key] = {
                 "data": data,
@@ -218,9 +219,13 @@ class Splatoon3Client:
             }
             # 记录访问时间
             self._cache_access_time[cache_key] = time.time()
-            # 每次设置新缓存时，随机触发一次过期缓存清理（概率10%）
-            if len(self._cache) > 10 and hash(cache_key) % 10 == 0:
-                await self._cleanup_expired_cache()
+            # 检查是否需要触发清理（每10次设置缓存操作触发一次）
+            if len(self._cache) % 10 == 0:
+                trigger_cleanup = True
+        
+        # 在锁外部执行清理操作，避免死锁
+        if trigger_cleanup:
+            await self._cleanup_expired_cache()
 
     async def _fetch_data(self, endpoint: str) -> dict:
         """从API获取数据"""
@@ -259,7 +264,7 @@ class Splatoon3Client:
                     self._log_api_data(endpoint, data)
                     return data
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                raise Splatoon3DataError(f"网络请求失败: {str(e)}") from e
+                raise Splatoon3NetworkError(f"网络请求失败: {str(e)}") from e
             except Exception as e:
                 if not isinstance(e, Splatoon3APIError):
                     raise Splatoon3DataError(f"获取数据失败: {str(e)}") from e
@@ -302,7 +307,7 @@ class Splatoon3Client:
                     else:
                         raise Splatoon3DataError(f"获取本地化数据失败: {response.status}")
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                raise Splatoon3DataError(f"网络请求失败: {str(e)}") from e
+                raise Splatoon3NetworkError(f"网络请求失败: {str(e)}") from e
             except Exception as e:
                 if not isinstance(e, Splatoon3APIError):
                     raise Splatoon3DataError(f"获取本地化数据失败: {str(e)}") from e
