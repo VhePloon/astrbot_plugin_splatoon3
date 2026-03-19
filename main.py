@@ -76,11 +76,6 @@ class Splatoon3Plugin(Star):
 
         if self.debug:
             logger.info("[Splatoon3] 调试模式已启用，API源数据将输出到日志")
-        
-        # 清理任务启动标志
-        self._cleanup_started = False
-        # 配置保存任务启动标志
-        self._config_save_started = False
 
     async def on_load(self):
         """插件加载时调用"""
@@ -145,14 +140,25 @@ class Splatoon3Plugin(Star):
         """获取用户唯一标识"""
         platform = getattr(event, 'platform', getattr(event, 'platform_name', 'unknown'))
         sender_id = None
-        # 尝试获取用户ID的不同属性名
-        for attr in ['sender_id', 'user_id', 'from_user', 'from_user_id']:
-            if hasattr(event, attr):
-                value = getattr(event, attr)
-                if value is not None and value != '':
-                    # 确保值是字符串类型，避免对象引用导致的不稳定
-                    sender_id = str(value)
-                    break
+        
+        # 尝试使用框架标准接口获取用户ID
+        if hasattr(event, 'get_sender_id') and callable(getattr(event, 'get_sender_id')):
+            try:
+                sender_id = event.get_sender_id()
+                if sender_id is not None and sender_id != '':
+                    sender_id = str(sender_id)
+            except Exception:
+                pass
+        
+        # 回退到传统属性获取方式（兼容不同平台）
+        if sender_id is None:
+            for attr in ['sender_id', 'user_id', 'from_user', 'from_user_id']:
+                if hasattr(event, attr):
+                    value = getattr(event, attr)
+                    if value is not None and value != '':
+                        # 确保值是字符串类型，避免对象引用导致的不稳定
+                        sender_id = str(value)
+                        break
         
         if sender_id is None:
             raise ValueError(f"无法从事件中获取用户ID，平台: {platform}")
@@ -228,11 +234,11 @@ class Splatoon3Plugin(Star):
             close_tasks = []
             for i, client in enumerate(clients_to_close):
                 if hasattr(client, 'close'):
-                    close_tasks.append(self._close_client_async(i, client))
+                    close_tasks.append(self._close_client_async(str(i), client))
             if close_tasks:
                 await asyncio.gather(*close_tasks, return_exceptions=True)
     
-    async def _close_client_async(self, index: int, client):
+    async def _close_client_async(self, index: str, client):
         """异步关闭客户端"""
         try:
             await client.close()
@@ -241,22 +247,6 @@ class Splatoon3Plugin(Star):
 
     async def _get_client(self, user_id: str) -> Splatoon3Client:
         """获取指定用户的API客户端"""
-        
-        # 延迟启动定时清理任务，确保事件循环已就绪
-        if not self._cleanup_started:
-            async with self._client_lock:
-                # 再次检查，防止竞态条件
-                if not self._cleanup_started:
-                    self._start_cleanup_task()
-                    self._cleanup_started = True
-        
-        # 延迟启动定时配置保存任务，确保事件循环已就绪
-        if not self._config_save_started:
-            async with self._client_lock:
-                # 再次检查，防止竞态条件
-                if not self._config_save_started:
-                    self._start_config_save_task()
-                    self._config_save_started = True
         
         # 先检查缓存（只读操作，使用锁）
         async with self._client_lock:
